@@ -9,7 +9,7 @@ module.exports = env => {
 		output: {
 			filename: '[name].js',
 			path: path.join(__dirname, 'dist'),
-			library: 'bookmarks-sync',
+			library: 'chrome-bookmark-share',
 			libraryTarget: 'umd',
 		},
 		mode: env.development ? 'development' : 'production',
