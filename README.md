@@ -2,7 +2,7 @@
 
 ## Usage
 ```javascript
-import { Folder } from 'bookmarks-sync';
+import { Folder } from 'chrome-bookmark-share';
 
 // Search root folder on Chrome
 const result = await Folder.search('FOLDER_NAME', '1');
