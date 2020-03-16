@@ -7,4 +7,4 @@ export const Bookmark = _Bookmark;
 export default {
   Folder,
   Bookmark,
-}
+};

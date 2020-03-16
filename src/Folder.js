@@ -1,6 +1,5 @@
 import Bookmark from './Bookmark';
 import api from './api';
-const CONTROL_TOKEN = Math.random();
 
 function Folder(data) {
 
@@ -17,15 +16,17 @@ function Folder(data) {
 
   this.children = [];
   this.meta = {
+    listening: false,
     ...Folder.DEFAULT_CONFIG,
   };
 }
+
+Folder.BOOKMARK_BAR_ID = '1';
 
 Folder.DEFAULT_CONFIG = {
   sync: {
     enabled: false,
     url: null,
-    auto: false,
   },
   backup: {
     enabled: true,
@@ -96,9 +97,10 @@ Folder.create = function (title, parentId, isRoot) {
 
 /**
  * Recursively instatiate Folder and Bookmarks from raw server data.
- * @param {{}}
+ * @param {{}} data
  */
-Folder.parse = function ({ children, ...raw }) {
+Folder.parse = function (data) {
+  const { children, ...raw } = data;
   const folder = new Folder(raw);
   folder.children = children.map(item => {
     if (Folder.isFolder(item)) {
@@ -151,7 +153,7 @@ Object.defineProperty(Folder.prototype, 'raw', {
 
 /**
  * Cast classes to plain objects and remove meta.
- * @returns {{}}
+ * @returns {string}
  */
 Object.defineProperty(Folder.prototype, 'key', {
   get: function () {
@@ -168,7 +170,6 @@ Object.defineProperty(Folder.prototype, 'local', {
    * Getter
    * @returns {{}} 
    */
-  // eslint-disable-next-line getter-return
   get() {
     try {
       const stored = window.localStorage.getItem(this.key);
@@ -179,6 +180,7 @@ Object.defineProperty(Folder.prototype, 'local', {
     }
     catch (err) {
       handleErrorPlaceholder(err);
+      return null;
     }
   },
   /**
@@ -226,60 +228,96 @@ Folder.prototype.config = function (opt = {}) {
       ...opt.backup,
     };
   }
-  if (this.meta.sync.auto) {
-    this._startListeners(CONTROL_TOKEN);
+  if (opt.sync.enabled && !opt.onAuth) {
+    throw new Error('Missing onAuth callback.');
   }
+  else {
+    this.meta.onAuth = opt.onAuth;
+  }
+  this.startListeners();
 };
 
 /**
  * Synchronize server and local folder to last modified.
  */
-Folder.prototype.sync = async function () {
+Folder.prototype.sync = function () {
   if (!this.meta.sync.enabled) throw new Error('Sync is disabled for this folder.');
   if (!this.meta.sync.url) throw new Error('Missing sync URL.');
-  try {
-    const serverData = await api.pull(this.meta.sync.url);
-    const localData = this.local;
-    const isDataOutdated = new Date(localData.edited.date) < new Date(serverData.edited.date);
-    if (isDataOutdated) {
-      await this.update(serverData.folder);
-      return 'SYNC_UPDATE_OK';
-    }
-    await api.push(this.meta.sync.url, this.raw);
-    return 'SYNC_PUSH_OK';
-  }
-  catch (err) {
-    handleErrorPlaceholder(err);
-  }
+
+  return api.pull(this.meta.sync.url, this)
+    .then(serverData => {
+      const localData = this.local;
+      if (localData && !serverData) {
+        return api.push(this.meta.sync.url, this.raw);
+      }
+      else if (!localData && serverData) {
+        return this.update(serverData.folder);
+      }
+      else if (localData && serverData) {
+        const localFolder = Folder.parse(localData.folder);
+        const serverFolder = Folder.parse(serverData.folder);
+        if (!localFolder.equal(serverFolder)) {
+          const localDate = new Date(localData.edited.date);
+          const serverDate = new Date(serverData.edited.date);
+          if (localDate >= serverDate) {
+            return api.push(this.meta.sync.url, this.raw);
+          }
+          return this.update(serverData.folder);
+        }
+      }
+      return Promise.resolve('SUCCESS_NO_CHANGES');
+    })
+    .catch(handleErrorPlaceholder);
 };
 
 /**
- * Update folder's properties with data from server.
- * Note: updates dateGroupModified.
+ * Compares relevant info form folders
+ * @param {Folder} other
+ * @returns {boolean}
+ */
+Folder.prototype.equal = function (other) {
+  if (this.title !== other.title) {
+    return false;
+  }
+  if (this.children.length !== other.children.length) {
+    return false;
+  }
+  let res = true;
+  for (let i = 0; i < this.children.length; i++) {
+    const child = this.children[i];
+    const otherChild = other.children[i];
+    if (child instanceof Object.getPrototypeOf(otherChild).constructor) {
+      res = res && child.equal(otherChild);
+    }
+    else {
+      return false;
+    }
+  }
+  return res;
+};
+
+/**
+ * Update folder's properties with raw data.
  * @param {{}} raw
  */
-Folder.prototype.update = async function (raw) {
-  await this.remove();
-  const folder = Folder.parse(raw);
-  this.children = folder.children;
-  await this.toChrome(this.parentId);
-  this.local = this.raw;
-};
-
-/**
- * Update folder from Chrome.
- * Push changes to server.
- * @returns {Promise}
- */
-Folder.prototype.push = async function () {
-  await this.fromChrome();
-  return this.sync();
+Folder.prototype.update = function (raw) {
+  return this.remove()
+    .then(() => {
+      const folder = Folder.parse(raw);
+      this.children = folder.children;
+      return this.toChrome(this.parentId);
+    })
+    .then(() => {
+      this.local = this.raw;
+      return 'SUCCESS_FOLDER_UPDATE';
+    });
 };
 
 /**
  * Remove a folder's children from Chrome.
+ * @returns {Promise}
  */
-Folder.prototype.removeChildren = async function () {
+Folder.prototype.removeChildren = function () {
   const deleteChildren = this.children.map(child => child.remove());
   return Promise.all(deleteChildren);
 };
@@ -289,37 +327,55 @@ Folder.prototype.removeChildren = async function () {
  * Update local data.
  * @returns {Folder}
  */
-Folder.prototype.fromChrome = async function () {
+Folder.prototype.fromChrome = function () {
   // Shallow search for children in Chrome
-  const children = await this.getChildren();
-  const { bookmarks, subFolders } = classify(children);
-  this.children = this.children.concat(bookmarks);
-  // Recursive promise for child folders
-  const subFoldersFromChrome = subFolders.map(subFolder => subFolder.fromChrome());
-  const readySubFolders = await Promise.all(subFoldersFromChrome);
-  this.children = this.children.concat(readySubFolders);
-  // Update local version to use on Folder.prototype.sync
-  this.local = this.raw;
-  return this;
+  return this.getChildren()
+    .then(children => {
+      const { bookmarks, subFolders } = classify(children);
+      this.children = [];
+      if (bookmarks.length) {
+        this.children = this.children.concat(bookmarks);
+      }
+      if (subFolders.length) {
+        // Recursive promise for child folders
+        const subFoldersFromChrome = subFolders.map(subFolder => subFolder.fromChrome());
+        return Promise.all(subFoldersFromChrome);
+      }
+      return Promise.resolve(null);
+    })
+    .then(readySubFolders => {
+      if (readySubFolders) {
+        this.children = this.children.concat(readySubFolders);
+      }
+      // Update local version to use on Folder.prototype.sync
+      this.local = this.raw;
+      return this;
+    });
 };
 
 /**
  * Create on Chrome and update instance.
  * Recursively do the same for the children.
+ * Note: chrome.bookmarks events will be fired
+ *       as a result of this method being called
  * @param {string} parentId
+ * @returns {Promise}
  */
-Folder.prototype.toChrome = async function (parentId) {
-
-  const readyFolder = await Folder.create(this.title, parentId);
-  this.id = readyFolder.id;
-  this.parentId = readyFolder.parentId;
-  this.dateAdded = readyFolder.dateAdded;
-  this.dateGroupModified = readyFolder.dateGroupModified;
-  this.index = readyFolder.index;
-  this.title = readyFolder.title;
-
-  const childrenToChrome = this.children.map(item => item.toChrome(this.id));
-  await Promise.all(childrenToChrome);
+Folder.prototype.toChrome = function (parentId) {
+  return Folder.create(this.title, parentId, this.meta.root)
+    .then(readyFolder => {
+      this.id = readyFolder.id;
+      this.parentId = readyFolder.parentId;
+      this.dateAdded = readyFolder.dateAdded;
+      this.dateGroupModified = readyFolder.dateGroupModified;
+      this.index = readyFolder.index;
+      this.title = readyFolder.title;
+      if (this.children.length) {
+        const childrenToChrome = this.children.map(item => item.toChrome(this.id));
+        return Promise.all(childrenToChrome);
+      }
+      return Promise.resolve();
+    })
 };
 
 /**
@@ -344,12 +400,17 @@ Folder.prototype.getChildren = function () {
   return new Promise((resolve, reject) => {
     try {
       chrome.bookmarks.getChildren(this.id, children => {
-        resolve(children.map(child => {
-          if (Folder.isFolder(child)) {
-            return new Folder(child);
-          }
-          return new Bookmark(child);
-        }));
+        if (children) {
+          resolve(children.map(child => {
+            if (Folder.isFolder(child)) {
+              return new Folder(child);
+            }
+            return new Bookmark(child);
+          }));
+        }
+        else {
+          resolve([]);
+        }
       });
     }
     catch (err) {
@@ -362,15 +423,19 @@ Folder.prototype.getChildren = function () {
  * Start listeners for events fired by Chrome.
  * Immediately push changes to server.
  */
-Folder.prototype._startListeners = function (_CONTROL_TOKEN) {
-  if (CONTROL_TOKEN !== _CONTROL_TOKEN) {
-    throw new Error('Illegal invocation. This method is private.');
+Folder.prototype.startListeners = function () {
+  if (!this.meta.listening) {
+    chrome.bookmarks.onCreated.addListener(this._handleEvent.bind(this, 'onCreated'));
+    chrome.bookmarks.onRemoved.addListener(this._handleEvent.bind(this, 'onRemoved'));
+    chrome.bookmarks.onChanged.addListener(this._handleEvent.bind(this, 'onChanged'));
+    chrome.bookmarks.onMoved.addListener(this._handleEvent.bind(this, 'onMoved'));
+    chrome.bookmarks.onChildrenReordered.addListener(this._handleEvent.bind(this, 'onChildrenReordered'));
+    this.meta.listening = true;
   }
-  chrome.bookmarks.onCreated.addListener(this.push.bind(this));
-  chrome.bookmarks.onRemoved.addListener(this.push.bind(this));
-  chrome.bookmarks.onChanged.addListener(this.push.bind(this));
-  chrome.bookmarks.onMoved.addListener(this.push.bind(this));
-  chrome.bookmarks.onChildrenReordered.addListener(this.push.bind(this));
+};
+
+Folder.prototype._handleEvent = function (eventName) {
+  return this.fromChrome();
 };
 
 export default Folder;

@@ -1,4 +1,4 @@
-# Chrome Bookmark Share
+# Bookmarks Sync
 
 ## Usage
 ```javascript

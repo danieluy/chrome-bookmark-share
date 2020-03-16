@@ -63,4 +63,19 @@ Bookmark.prototype.toChrome = async function (parentId) {
   this.index = readyBookmark.index;
 };
 
+/**
+ * Compares relevant info form bookmarks
+ * @param {Bookmark} other
+ * @returns {boolean}
+ */
+Bookmark.prototype.equal = function (other) {
+  if (this.title !== other.title) {
+    return false;
+  }
+  if (this.url !== other.url) {
+    return false;
+  }
+  return true;
+};
+
 export default Bookmark;
