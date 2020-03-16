@@ -1,4 +1,4 @@
-# Bookmarks Sync
+# Bookmarks Share
 
 ## Usage
 ```javascript
@@ -34,5 +34,5 @@ folder.config({
 # On this module root directory
 $ npm link
 # On the root of the folder that will import this package
-$ npm link bookmarks-sync
+$ npm link bookmarks-share
 ```
