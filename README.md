@@ -1,4 +1,4 @@
-# Bookmarks Share
+# Chrome Bookmarks Share
 
 ## Usage
 ```javascript

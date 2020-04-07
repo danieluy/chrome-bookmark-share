@@ -17,6 +17,7 @@ function Folder(data) {
   this.children = [];
   this.meta = {
     listening: false,
+    updating: false,
     ...Folder.DEFAULT_CONFIG,
   };
 }
@@ -24,14 +25,50 @@ function Folder(data) {
 Folder.BOOKMARK_BAR_ID = '1';
 
 Folder.DEFAULT_CONFIG = {
-  sync: {
-    enabled: false,
-    url: null,
-  },
+  syncURL: null,
   backup: {
     enabled: true,
     length: 3,
   },
+};
+
+Folder.init = async function ({
+  title,
+  parentId = Folder.BOOKMARK_BAR_ID,
+  syncURL,
+  onAuth,
+  onError = () => 0,
+}) {
+  // Options check
+  if (!title) throw new Error('Missing title.');
+  if (!syncURL) throw new Error('Missing syncURL.');
+  if (!onAuth) throw new Error('Missing onAuth callback.');
+  // Search root folder on Chrome
+  let [folder] = await Folder.find(title, parentId);
+  if (folder) {
+    // Load root folder's children from Chrome
+    // Update local data
+    await folder.fromChrome();
+    folder.meta.root = true;
+  }
+  else {
+    // Create root folder on Chrome
+    folder = await Folder.createRoot(title, parentId);
+  }
+  // Config meta
+  folder.meta.syncURL = syncURL;
+  folder.meta.onAuth = onAuth;
+  folder.meta.onError = onError;
+
+  // Init listeners to capture changes on Chrome
+  folder.startListeners();
+  // Initial data sync
+  const res = await folder.sync();
+
+  return {
+    folder,
+    syncResult: res,
+  };
 };
 
 /**
@@ -49,7 +86,7 @@ Folder.isFolder = function (candidate) {
  * @param {string} parentId?
  * @returns {Folder[]}
  */
-Folder.search = function (title, parentId) {
+Folder.find = function (title, parentId) {
   return new Promise((resolve, reject) => {
     try {
       chrome.bookmarks.search({ title }, results => {
@@ -77,17 +114,34 @@ Folder.search = function (title, parentId) {
  * @param {string} parentId
  * @returns {Folder}
  */
-Folder.create = function (title, parentId, isRoot) {
+Folder.create = function (title, parentId) {
   return new Promise((resolve, reject) => {
     try {
       chrome.bookmarks.create({ title, parentId }, result => {
         const folder = new Folder(result);
-        if (isRoot) {
-          folder.meta.root = true;
-          folder.local = folder.raw;
-        }
         resolve(folder);
       });
+    }
+    catch (err) {
+      reject(err);
+    }
+  });
+};
+
+/**
+ * Creates a folder in Chrome and sets it internally as root.
+ * Sets local version of the Folder.
+ * @param {string} title
+ * @param {string} parentId
+ * @returns {Folder}
+ */
+Folder.createRoot = function (title, parentId) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const folder = await Folder.create(title, parentId);
+      folder.meta.root = true;
+      folder.local = folder.raw;
+      resolve(folder);
     }
     catch (err) {
       reject(err);
@@ -126,7 +180,7 @@ Folder.backup = function (folder) {
     window.localStorage.setItem(`BACKUP_${folder.key}`, JSON.stringify(body));
   }
   catch (err) {
-    handleErrorPlaceholder(err);
+    this.errorHandler(err);
   }
 };
 
@@ -161,113 +215,113 @@ Object.defineProperty(Folder.prototype, 'key', {
   },
 });
 
-/**
- * Store and retrieve state from localStorage.
- * Used on Folder.prototype.sync
- */
-Object.defineProperty(Folder.prototype, 'local', {
-  /**
-   * Getter
-   * @returns {{}} 
-   */
-  get() {
-    try {
-      const stored = window.localStorage.getItem(this.key);
-      if (stored) {
-        return JSON.parse(stored);
-      }
-      return null;
+Folder.prototype.getLocal = function () {
+  try {
+    const stored = window.localStorage.getItem(this.key);
+    if (stored) {
+      return JSON.parse(stored);
     }
-    catch (err) {
-      handleErrorPlaceholder(err);
-      return null;
-    }
-  },
-  /**
-   * Setter
-   * @param {{}} rawFolder
-   */
-  set(rawFolder) {
-    if (!(rawFolder instanceof Object)) {
-      throw new TypeError(`Cannot store type ${typeof rawFolder}. Expected object.`);
-    }
-    if (!this.meta.root) {
-      // Only root folder should be stored
-      return;
-    }
-    try {
-      const body = {
-        folder: rawFolder,
-        edited: {
-          date: new Date(),
-          user: '',
-        },
-      };
-      window.localStorage.setItem(this.key, JSON.stringify(body));
-    }
-    catch (err) {
-      handleErrorPlaceholder(err);
-    }
-  },
-});
+    return null;
+  }
+  catch (err) {
+    this.errorHandler(err);
+    return null;
+  }
+};
 
 /**
- * Set config options from partial options.
- * @param {{}} opt
+ * Stores local data
+ * @param {{}} rawFolder
+ * @param {Date} date?
  */
-Folder.prototype.config = function (opt = {}) {
-  if (opt.sync) {
-    this.meta.sync = {
-      ...this.meta.sync,
-      ...opt.sync,
+Folder.prototype.setLocal = function (rawFolder, date) {
+  if (!(rawFolder instanceof Object)) {
+    throw new TypeError(`Cannot store type ${typeof rawFolder}. Expected object.`);
+  }
+  if (!this.meta.root) {
+    // Only root folder should be stored
+    return;
+  }
+  try {
+    const body = {
+      folder: rawFolder,
+      edited: {
+        date: date || new Date(),
+        user: '',
+      },
     };
+    window.localStorage.setItem(this.key, JSON.stringify(body));
   }
-  if (opt.backup) {
-    this.meta.backup = {
-      ...this.meta.backup,
-      ...opt.backup,
-    };
+  catch (err) {
+    this.errorHandler(err);
   }
-  if (opt.sync.enabled && !opt.onAuth) {
-    throw new Error('Missing onAuth callback.');
-  }
-  else {
-    this.meta.onAuth = opt.onAuth;
-  }
-  this.startListeners();
+};
+
+/**
+ * Unifies error handling
+ */
+Folder.prototype.errorHandler = function (error) {
+  /**
+   * #####       ####
+   *   #    ###  #   #  ###
+   *   #   #   # #   # #   #
+   *   #   #   # #   # #   #
+   *   #    ###  ####   ###
+   *
+   * ToDo: maybe return a standardized error
+   */
+  this.onError(error);
 };
 
 /**
  * Synchronize server and local folder to last modified.
  */
 Folder.prototype.sync = function () {
-  if (!this.meta.sync.enabled) throw new Error('Sync is disabled for this folder.');
-  if (!this.meta.sync.url) throw new Error('Missing sync URL.');
-
-  return api.pull(this.meta.sync.url, this)
+  // Request data from server
+  return api.pull(this.meta.syncURL, this)
     .then(serverData => {
-      const localData = this.local;
-      if (localData && !serverData) {
-        return api.push(this.meta.sync.url, this.raw);
-      }
-      else if (!localData && serverData) {
-        return this.update(serverData.folder);
-      }
-      else if (localData && serverData) {
+      // Request local data
+      const localData = this.getLocal();
+      if (localData && serverData) {
+        // Common case
         const localFolder = Folder.parse(localData.folder);
         const serverFolder = Folder.parse(serverData.folder);
+        // Check equality
         if (!localFolder.equal(serverFolder)) {
+          // Compare dates
           const localDate = new Date(localData.edited.date);
           const serverDate = new Date(serverData.edited.date);
-          if (localDate >= serverDate) {
-            return api.push(this.meta.sync.url, this.raw);
+          if (localDate > serverDate) {
+            return api.push(this.meta.syncURL, this.raw);
           }
-          return this.update(serverData.folder);
+          if (localDate < serverDate) {
+            return this.update(serverData.folder, serverDate);
+          }
         }
       }
-      return Promise.resolve('SUCCESS_NO_CHANGES');
+      else if (localData && !serverData) {
+        // No server data, first use for a given syncURL
+        return api.push(this.meta.syncURL, this.raw);
+      }
+      else if (!localData && serverData) {
+        // No local data, installation on browser or reset
+        const serverDate = new Date(serverData.edited.date);
+        return this.update(serverData.folder, serverDate);
+      }
+      return Promise.resolve('SYNC_SUCCESS_NO_CHANGES');
     })
-    .catch(handleErrorPlaceholder);
+    .then(res => {
+      if (res === 'SUCCESS_FOLDER_UPDATE') {
+        return Promise.resolve('SYNC_SUCCESS_SERVER_PULL');
+      }
+      if (res === 'SUCCESS_API_PUSH') {
+        return Promise.resolve('SYNC_SUCCESS_SERVER_PUSH');
+      }
+      return Promise.resolve(res);
+    })
+    .catch(error => {
+      this.errorHandler(error);
+    });
 };
 
 /**
@@ -297,18 +351,22 @@ Folder.prototype.equal = function (other) {
 };
 
 /**
- * Update folder's properties with raw data.
+ * Update folder's properties with raw data and pushes to Chrome.
+ * Sets local version of the Folder.
  * @param {{}} raw
+ * @param {Date} date
  */
-Folder.prototype.update = function (raw) {
+Folder.prototype.update = function (raw, date) {
   return this.remove()
     .then(() => {
       const folder = Folder.parse(raw);
       this.children = folder.children;
+      this.meta.updating = true;
       return this.toChrome(this.parentId);
     })
     .then(() => {
-      this.local = this.raw;
+      this.setLocal(this.raw, date);
+      this.meta.updating = false;
       return 'SUCCESS_FOLDER_UPDATE';
     });
 };
@@ -347,8 +405,7 @@ Folder.prototype.fromChrome = function () {
       if (readySubFolders) {
         this.children = this.children.concat(readySubFolders);
       }
-      // Update local version to use on Folder.prototype.sync
-      this.local = this.raw;
+      this.setLocal(this.raw);
       return this;
     });
 };
@@ -356,12 +413,20 @@ Folder.prototype.fromChrome = function () {
 /**
  * Create on Chrome and update instance.
  * Recursively do the same for the children.
- * Note: chrome.bookmarks events will be fired
- *       as a result of this method being called
+ * Note: chrome.bookmarks events won't be fired
  * @param {string} parentId
  * @returns {Promise}
  */
 Folder.prototype.toChrome = function (parentId) {
+  /**
+   * #####       ####
+   *   #    ###  #   #  ###
+   *   #   #   # #   # #   #
+   *   #   #   # #   # #   #
+   *   #    ###  ####   ###
+   *
+   * ToDo: remove event listeners and set them again when finish
+   */
   return Folder.create(this.title, parentId, this.meta.root)
     .then(readyFolder => {
       this.id = readyFolder.id;
@@ -375,7 +440,7 @@ Folder.prototype.toChrome = function (parentId) {
         return Promise.all(childrenToChrome);
       }
       return Promise.resolve();
-    })
+    });
 };
 
 /**
@@ -434,8 +499,22 @@ Folder.prototype.startListeners = function () {
   }
 };
 
+/**
+ * Hooks to Chrome bookmarks events.
+ * Takes data from Chrome
+ * @param {String} eventName
+ * @returns {Promise<Folder>}
+ */
 Folder.prototype._handleEvent = function (eventName) {
-  return this.fromChrome();
+  if (this.meta.updating) return;
+
+  this.fromChrome()
+    .then(() => api.push(this.meta.syncURL, this.raw))
+    .then(result => console.log({
+      eventName,
+      result,
+    }))
+    .catch(this.errorHandler);
 };
 
 export default Folder;
@@ -455,8 +534,4 @@ function classify(items) {
     }
     return classified;
   }, { bookmarks: [], subFolders: [] });
-}
-
-function handleErrorPlaceholder(error) {
-  throw error;
 }

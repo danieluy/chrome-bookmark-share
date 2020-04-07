@@ -114,7 +114,7 @@ function auth(url, userName, password) {
 
 function handleResponseError(response, folder) {
   if (response.status === 401) {
-    folder.meta.onAuth((userName, password) => auth(folder.meta.sync.url, userName, password));
+    folder.meta.onAuth((userName, password) => auth(folder.meta.syncURL, userName, password));
   }
   else {
     throw Error(response.statusText);
